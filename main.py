@@ -1,71 +1,186 @@
-"""Orquestrador do pipeline EdStats.
+"""Serviço HTTP (FastAPI) que expõe o pipeline EdStats para o n8n.
 
-Executa os 8 scripts na ordem correta, encadeando a saída de uma etapa como
-entrada da próxima (ver diagrama no README). Cada etapa é um processo Python
-separado — se qualquer uma falhar, o pipeline para imediatamente.
+Por que existe:
+    O nó 'Execute Command' do n8n foi descontinuado. Agora o n8n dispara o
+    pipeline pelo nó 'HTTP Request' (POST /pipeline/run). Este arquivo mantém a
+    orquestração por SUBPROCESS (cada etapa é um processo Python isolado — se uma
+    falhar, o pipeline para; e a memória do CSV é liberada entre etapas), mas
+    embrulha tudo numa API com validação, tratamento de erro e resposta JSON.
 
-Uso:
+Rodar em desenvolvimento:
+    uvicorn main:app --reload --host 0.0.0.0 --port 8000
+    # docs interativas: http://localhost:8000/docs
+
+Ainda funciona como CLI (compatibilidade):
     python main.py
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
-from fastapi import FastAPI
 
-app = FastAPI()
+from fastapi import Depends, FastAPI, Header, HTTPException
+from pydantic import BaseModel, Field
 
-# Diretórios base, relativos a este arquivo (não ao working dir de quem chama).
-RAIZ = Path(__file__).resolve().parent
-SCRIPTS = RAIZ / "scripts"
-RAW = RAIZ / "data" / "raw"
-PROC = RAIZ / "data" / "processed"
+# Importar config ancora a raiz no sys.path e carrega o .env (fonte única de config).
+from config import settings
 
-# Arquivo bruto de entrada do World Bank EdStats.
-ENTRADA = RAW / "WB_EDSTATS_WIDEF.csv"
+# ------------------------------------------------------------------
+# Diretórios e caminhos dos artefatos (vindos do config central).
+# ------------------------------------------------------------------
+SCRIPTS = settings.project_root / "scripts"
+PROC = settings.processed_path
 
-# Cada etapa: (script, entrada, saida, *args_opcionais).
-# A ordem respeita as dependências: 01→02→03 (base tidy) → análises → export.
 S1 = PROC / "s1.csv"
 S2 = PROC / "s2.csv"
 S3 = PROC / "s3.csv"  # base "tidy" — entrada das análises 04–07
+AGREGACOES = PROC / "agregacoes.csv"
+RANKINGS = PROC / "rankings.csv"
 CRESCIMENTO = PROC / "crescimento.csv"
-
-ETAPAS = [
-    ("01_limpeza.py",     ENTRADA,     S1),
-    ("02_ausentes.py",    S1,          S2),
-    ("03_selecao.py",     S2,          S3),
-    ("04_agregacoes.py",  S3,          PROC / "agregacoes.csv"),
-    ("05_rankings.py",    S3,          PROC / "rankings.csv"),
-    ("06_crescimento.py", S3,          CRESCIMENTO),
-    ("07_comparacao.py",  S3,          PROC / "comparacao.csv"),
-    ("08_export.py",      CRESCIMENTO, PROC / "edstats_final.csv"),
-]
+COMPARACAO = PROC / "comparacao.csv"
+FINAL = PROC / "edstats_final.csv"
 
 
-def main() -> None:
-    if not ENTRADA.exists():
-        sys.exit(f"Arquivo bruto não encontrado: {ENTRADA}")
+# ------------------------------------------------------------------
+# Contrato de entrada (DTO). Pydantic valida e documenta sozinho.
+# Todos os campos são opcionais e caem em defaults sensatos.
+# ------------------------------------------------------------------
+class PipelineRequest(BaseModel):
+    entrada: str | None = Field(
+        default=None,
+        description="Caminho do CSV bruto. Se omitido, usa settings.raw_data_path.",
+    )
+    estrategia_ausentes: str = Field(
+        default="descartar",
+        description="Etapa 02: descartar | mediana | media | zero.",
+    )
+    indicadores: list[str] | None = Field(
+        default=None,
+        description="Etapa 03: filtra estes códigos de indicador. Vazio = todos.",
+    )
+    indicador_comparacao: str | None = Field(
+        default=None,
+        description="Etapa 07: indicador da matriz país×ano. Vazio = o de maior cobertura.",
+    )
 
+
+def montar_etapas(entrada: Path, req: PipelineRequest) -> list[tuple[str, Path, Path, list[str]]]:
+    """Monta a lista de etapas (script, entrada, saída, args_extra) já com os
+    parâmetros opcionais do request injetados nas etapas que os aceitam.
+
+    O DAG: 01→02→03 (base tidy) → 04/05/07 partem da base; 06 parte de 05;
+    08 finaliza a série com crescimento.
+    """
+    return [
+        ("01_limpeza.py", entrada, S1, []),
+        ("02_ausentes.py", S1, S2, [req.estrategia_ausentes]),
+        ("03_selecao.py", S2, S3, [",".join(req.indicadores)] if req.indicadores else []),
+        ("04_agregacoes.py", S3, AGREGACOES, []),
+        ("05_rankings.py", S3, RANKINGS, []),
+        ("06_crescimento.py", RANKINGS, CRESCIMENTO, []),
+        ("07_comparacao.py", S3, COMPARACAO, [req.indicador_comparacao] if req.indicador_comparacao else []),
+        ("08_export.py", CRESCIMENTO, FINAL, []),
+    ]
+
+
+def executar_pipeline(req: PipelineRequest) -> list[str]:
+    """Roda todas as etapas em sequência via subprocess. Devolve os logs (stdout)
+    de cada etapa. Levanta HTTPException em caso de entrada ou execução inválida.
+    """
     PROC.mkdir(parents=True, exist_ok=True)
 
-    for script, entrada, saida, *extra in ETAPAS:
-        print(f"Executando {script}...")
-        # sys.executable garante o MESMO python (o do venv), não um "python" do PATH.
-        cmd = [sys.executable, str(SCRIPTS / script), str(entrada), str(saida), *extra]
-        # check=True: se a etapa retornar exit code != 0, levanta erro e o
-        # pipeline para aqui — evita rodar as etapas seguintes com lixo/vazio.
-        subprocess.run(cmd, check=True)
+    entrada = Path(req.entrada) if req.entrada else settings.raw_data_path
+    if not entrada.exists():
+        raise HTTPException(status_code=404, detail=f"Entrada não encontrada: {entrada}")
 
-    print(f"\nPipeline concluído. Resultado final em: {PROC / 'edstats_final.csv'}")
+    # Força o processo-filho a EMITIR UTF-8 no stdout/stderr (no Windows o
+    # default seria cp1252), casando com o encoding que usamos para capturar.
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+
+    logs: list[str] = []
+    for script, ent, saida, extra in montar_etapas(entrada, req):
+        # sys.executable => o MESMO python do venv, não um "python" qualquer do PATH.
+        cmd = [sys.executable, str(SCRIPTS / script), str(ent), str(saida), *extra]
+        try:
+            # check=True: exit code != 0 vira CalledProcessError e o pipeline para.
+            # capture_output: guardamos stdout/stderr para observabilidade na resposta.
+            # encoding=utf-8: no Windows o default é cp1252 e truncaria acentos dos logs.
+            resultado = subprocess.run(
+                cmd, check=True, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", env=env,
+            )
+        except subprocess.CalledProcessError as exc:
+            # Os scripts usam sys.exit(msg) para erros de validação; a mensagem
+            # cai no stderr. Surface isso ao chamador (n8n) em vez de engolir.
+            detalhe = (exc.stderr or exc.stdout or "").strip() or f"Falha em {script}"
+            # Traceback => bug inesperado (500). Mensagem simples => validação (422).
+            status = 500 if "Traceback" in detalhe else 422
+            raise HTTPException(status_code=status, detail=f"[{script}] {detalhe}") from exc
+        logs.append(resultado.stdout.strip())
+    return logs
 
 
-if __name__ == "__main__":
-    main()
+# ------------------------------------------------------------------
+# Segurança: autenticação OPCIONAL por token de cabeçalho.
+# Ao expor o pipeline via HTTP, qualquer um na rede pode chamá-lo. Se
+# PIPELINE_API_KEY existir no .env, exigimos o header 'X-API-Key' igual
+# a ele; sem a variável, o serviço fica aberto (conveniente em dev).
+# ------------------------------------------------------------------
+API_KEY = os.getenv("PIPELINE_API_KEY")
 
 
-@app.get("/run")
+def verificar_token(x_api_key: str | None = Header(default=None)) -> None:
+    if API_KEY and x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="Token de API inválido ou ausente.")
+
+
+app = FastAPI(
+    title="Pipeline EdStats",
+    version="1.0.0",
+    description="Orquestra as 8 etapas de ETL do World Bank EdStats para o n8n.",
+)
+
+@app.get("/")
+def root():
+    return {"message": "Servidor FastAPI está rodando!"}
+
+@app.post("pipeline/run")
 def run_pipeline():
     subprocess.run(["python", "main.py"])
     return {"status": "Pipeline executado com sucesso"}
+
+
+@app.get("/health")
+def health() -> dict:
+    """Health check — o n8n/monitoramento verifica se o serviço está no ar."""
+    return {"status": "ok", "raw_data_path": str(settings.raw_data_path)}
+
+
+@app.post("/pipeline/run", dependencies=[Depends(verificar_token)])
+def run_pipeline(req: PipelineRequest) -> dict:
+    """Executa o pipeline completo e devolve os caminhos dos artefatos + logs."""
+    logs = executar_pipeline(req)
+    return {
+        "status": "ok",
+        "parametros": req.model_dump(),
+        "artefatos": {
+            "serie_base": str(S3),
+            "agregacoes": str(AGREGACOES),
+            "rankings": str(RANKINGS),
+            "crescimento": str(CRESCIMENTO),
+            "comparacao": str(COMPARACAO),
+            "final": str(FINAL),
+        },
+        "logs": logs,
+    }
+
+
+# ------------------------------------------------------------------
+# Compatibilidade: ainda dá para rodar o pipeline pelo terminal.
+# ------------------------------------------------------------------
+if __name__ == "__main__":
+    for linha in executar_pipeline(PipelineRequest()):
+        print(linha)
+    print(f"\nPipeline concluído. Resultado final em: {FINAL}")
