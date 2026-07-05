@@ -12,6 +12,9 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from fastapi import FastAPI
+
+app = FastAPI()
 
 # Diretórios base, relativos a este arquivo (não ao working dir de quem chama).
 RAIZ = Path(__file__).resolve().parent
@@ -60,3 +63,9 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+@app.get("/run")
+def run_pipeline():
+    subprocess.run(["python", "main.py"])
+    return {"status": "Pipeline executado com sucesso"}
