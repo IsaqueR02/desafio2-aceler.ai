@@ -146,7 +146,7 @@ app = FastAPI(
 def root():
     return {"message": "Servidor FastAPI está rodando!"}
 
-@app.post("pipeline/run")
+@app.post("/pipeline/run")
 def run_pipeline():
     subprocess.run(["python", "main.py"])
     return {"status": "Pipeline executado com sucesso"}
