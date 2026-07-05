@@ -1,96 +1,115 @@
-# 🎓 Agente Inteligente de Monitoramento Educacional
+# 🌍 Pipeline de Tratamento EdStats — scripts modulares para n8n
 
-Automatiza o fluxo completo de **coleta → tratamento → análise → relatório**
-de dados educacionais, usando **IA (OpenAI)** para gerar insights pedagógicos
-e distribuindo o resultado em **Markdown, PDF e e-mail**.
+Conjunto de **8 scripts Python independentes**, um por etapa de tratamento de
+dados do **World Bank EdStats**. Cada script é uma função única, recebe um CSV
+de entrada e grava um CSV de saída — desenhados para virar **nós no n8n**
+(Execute Command), mas rodam também isolados no terminal.
 
-## Como funciona
+## Fluxo
 
 ```
-┌──────────┐   ┌────────────┐   ┌───────────┐   ┌────────────┐
-│  COLETA  │──▶│ TRATAMENTO │──▶│  ANÁLISE  │──▶│ RELATÓRIO  │
-│ CSV/XLSX │   │ limpa e    │   │ métricas  │   │ MD + PDF   │
-│          │   │ consolida  │   │ + IA (GPT)│   │ + e-mail   │
-└──────────┘   └────────────┘   └───────────┘   └────────────┘
+raw.csv
+  │
+  ▼ 01_limpeza      limpa + wide→long
+  ▼ 02_ausentes     trata valores faltantes
+  ▼ 03_selecao      totais + colunas essenciais (série única)  ──► base "tidy"
+        ├─► 04_agregacoes    estatísticas por indicador×ano
+        ├─► 05_rankings      posição dos países por indicador×ano
+        ├─► 06_crescimento   variação % ano a ano
+        └─► 07_comparacao    pivot países × anos (1 indicador)
+  ▼ 08_export       CSV final otimizado (sem índice)
 ```
 
-- **Coleta** (`src/coleta.py`): lê `alunos`, `notas` e `frequencia` de `data/raw` (CSV ou Excel).
-- **Tratamento** (`src/tratamento.py`): limpa, valida, consolida por aluno e classifica situação/risco de evasão.
-- **Análise** (`src/analise.py`): calcula indicadores por escola/turma e gera insights com a OpenAI (com fallback local se a IA não estiver configurada).
-- **Relatório** (`src/relatorio.py`): monta Markdown, converte para PDF e envia por e-mail.
-- **Agente** (`src/agente.py`): orquestra tudo de ponta a ponta.
+As etapas **01→02→03** formam a cadeia de limpeza. A partir da base *tidy*
+(saída de `03`), as etapas **04–07** são análises independentes (podem rodar em
+paralelo). `08` exporta qualquer resultado tratado como CSV final.
+
+## Contrato de cada script
+
+```bash
+python scripts/NN_nome.py <entrada.csv> <saida.csv> [arg_opcional]
+```
+
+| Script | Função | Arg. opcional |
+|---|---|---|
+| `01_limpeza.py` | `limpar_dados` | — |
+| `02_ausentes.py` | `tratar_ausentes` | estratégia: `descartar`(padrão)`\|mediana\|media\|zero` |
+| `03_selecao.py` | `selecionar_indicadores` | lista de códigos: `COD1,COD2,...` |
+| `04_agregacoes.py` | `agregar` | — |
+| `05_rankings.py` | `rankear` | — |
+| `06_crescimento.py` | `calcular_crescimento` | — |
+| `07_comparacao.py` | `comparar_paises` | código do indicador |
+| `08_export.py` | `exportar_csv_final` | — |
+
+**Schema da base tidy** (saída de `03`): `pais_codigo, pais_nome,
+indicador_codigo, indicador_nome, ano, valor`.
 
 ## Instalação
 
 ```bash
 python -m venv .venv
-.venv\Scripts\activate        # Windows (PowerShell: .venv\Scripts\Activate.ps1)
+# Windows PowerShell:
+.venv\Scripts\Activate.ps1
+# Linux/macOS:
+source .venv/bin/activate
+
 pip install -r requirements.txt
 ```
 
-## Configuração
-
-Copie `.env.example` para `.env` e preencha:
+## Uso rápido (terminal)
 
 ```bash
-copy .env.example .env
+R=data/raw/WB_EDSTATS_WIDEF.csv
+P=data/processed
+
+python scripts/01_limpeza.py     $R              $P/s1.csv
+python scripts/02_ausentes.py    $P/s1.csv       $P/s2.csv
+python scripts/03_selecao.py     $P/s2.csv       $P/s3.csv
+python scripts/04_agregacoes.py  $P/s3.csv       $P/agregacoes.csv
+python scripts/05_rankings.py    $P/s3.csv       $P/rankings.csv
+python scripts/06_crescimento.py $P/s3.csv       $P/crescimento.csv
+python scripts/07_comparacao.py  $P/s3.csv       $P/comparacao.csv
+python scripts/08_export.py      $P/crescimento.csv $P/edstats_final.csv
 ```
 
-- `OPENAI_API_KEY` — chave da OpenAI (sem ela, o agente usa análise local).
-- Bloco `SMTP_*` / `EMAIL_*` — credenciais de e-mail (Gmail: use uma **Senha de app**).
-- `NOTA_MINIMA_APROVACAO`, `FREQUENCIA_MINIMA` — regras de negócio.
+## Integração com o n8n
 
-> Tudo é opcional para testar: sem chave e sem SMTP, o pipeline roda e gera o Markdown/PDF localmente.
+Cada etapa vira um nó **Execute Command** encadeado. O host do n8n precisa ter
+Python + `pandas`/`numpy` instalados (ou usar uma imagem custom).
 
-## Uso
+Exemplo de comando em um nó:
 
 ```bash
-# 1) Gerar dados de exemplo e rodar o fluxo completo
-python main.py --gerar-dados
-
-# 2) Rodar com seus próprios dados (colocados em data/raw)
-python main.py
+python /data/scripts/02_ausentes.py /data/processed/s1.csv /data/processed/s2.csv mediana
 ```
 
-Saídas em `reports/` (`.md` e `.pdf`) e tabela consolidada em `data/processed/consolidado.csv`.
+Padrão de wiring:
 
-## Formato dos dados de entrada (`data/raw/`)
+```
+[Manual/Schedule Trigger]
+   -> [Execute Command: 01_limpeza]
+   -> [Execute Command: 02_ausentes]
+   -> [Execute Command: 03_selecao]   (produz a base tidy)
+        |-> [Execute Command: 04_agregacoes]
+        |-> [Execute Command: 05_rankings]
+        |-> [Execute Command: 06_crescimento] -> [Execute Command: 08_export]
+        |-> [Execute Command: 07_comparacao]
+```
 
-**alunos.csv**
-
-| id_aluno | nome        | turma | serie   |
-|----------|-------------|-------|---------|
-| 1        | Ana Silva   | 9A    | 9º Ano  |
-
-**notas.csv**
-
-| id_aluno | disciplina | bimestre | nota |
-|----------|------------|----------|------|
-| 1        | Matemática | 1        | 7.5  |
-
-**frequencia.csv**
-
-| id_aluno | disciplina | aulas_dadas | faltas |
-|----------|------------|-------------|--------|
-| 1        | Matemática | 80          | 4      |
+Dicas:
+- Use caminhos **absolutos** nos comandos (o working dir do n8n varia).
+- Cada script loga um resumo no **stdout** (linha `[NN] ...`) — aparece na saída
+  do nó e ajuda no debug.
+- Erros de uso saem com **exit code ≠ 0**, então o nó falha corretamente.
 
 ## Estrutura
 
 ```
-desafio2/
-├── main.py              # entrypoint (CLI)
-├── config.py           # configuração e regras de negócio
-├── requirements.txt
-├── .env.example
+.
+├── scripts/            # os 8 scripts (um por etapa)
 ├── data/
-│   ├── raw/            # entrada (CSV/Excel)
-│   └── processed/      # consolidado gerado
-├── reports/            # relatórios (.md / .pdf)
-└── src/
-    ├── gerar_dados.py  # gerador de dataset fictício
-    ├── coleta.py       # etapa 1
-    ├── tratamento.py   # etapa 2
-    ├── analise.py      # etapa 3 (métricas + IA)
-    ├── relatorio.py    # etapa 4 (MD/PDF/e-mail)
-    └── agente.py       # orquestrador
+│   ├── raw/            # CSV de entrada (WB_EDSTATS_WIDEF.csv)
+│   └── processed/      # saídas (ignoradas pelo git)
+├── requirements.txt
+└── README.md
 ```
