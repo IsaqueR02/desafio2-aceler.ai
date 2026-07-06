@@ -101,6 +101,16 @@ class Settings:
         default_factory=lambda: _get("OPENAI_MODEL", "gpt-4o-mini") or "gpt-4o-mini"
     )
 
+    # ---- Supabase Storage (persistência dos artefatos fora do disco efêmero) ----
+    # supabase_key deve ser a SERVICE ROLE key: o upload é server-side e essa chave
+    # ignora RLS. NUNCA exponha em frontend/cliente. Ambas opcionais: o ETL puro
+    # roda sem Supabase; a validação fica em require_supabase().
+    supabase_url: str | None = field(default_factory=lambda: _get("SUPABASE_URL"))
+    supabase_key: str | None = field(default_factory=lambda: _get("SUPABASE_KEY"))
+    supabase_bucket: str = field(
+        default_factory=lambda: _get("SUPABASE_BUCKET", "artefatos") or "artefatos"
+    )
+
     # ---- Caminhos de dados ----
     raw_data_path: Path = field(
         default_factory=lambda: _get_path("RAW_DATA_PATH", "data/raw/WB_EDSTATS_WIDEF.csv")
@@ -131,15 +141,32 @@ class Settings:
             )
         return self.openai_api_key
 
+    def require_supabase(self) -> tuple[str, str]:
+        """Retorna (url, key) do Supabase ou falha na hora, com mensagem clara.
+
+        Chame só no código que de fato sobe artefatos, para não travar o ETL puro.
+        """
+        if not self.supabase_url or not self.supabase_key:
+            raise RuntimeError(
+                "[config] SUPABASE_URL/SUPABASE_KEY ausentes. Preencha no .env "
+                "(use a service_role key — apenas backend)."
+            )
+        return self.supabase_url, self.supabase_key
+
     def __repr__(self) -> str:
         """Repr seguro: NUNCA imprime a chave de API inteira em logs."""
         chave = self.openai_api_key or ""
         chave_mascarada = f"{chave[:6]}...{chave[-4:]}" if len(chave) > 12 else "<oculta>"
+        sb = self.supabase_key or ""
+        sb_mascarada = f"{sb[:6]}...{sb[-4:]}" if len(sb) > 12 else "<oculta>"
         return (
             "Settings("
             f"database_url={self.database_url!r}, "
             f"openai_model={self.openai_model!r}, "
             f"openai_api_key={chave_mascarada!r}, "
+            f"supabase_url={self.supabase_url!r}, "
+            f"supabase_key={sb_mascarada!r}, "
+            f"supabase_bucket={self.supabase_bucket!r}, "
             f"raw_data_path={str(self.raw_data_path)!r}, "
             f"processed_path={str(self.processed_path)!r}, "
             f"default_countries={self.default_countries!r}, "
