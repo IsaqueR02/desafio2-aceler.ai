@@ -24,6 +24,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 # Importar config ancora a raiz no sys.path e carrega o .env (fonte única de config).
@@ -229,7 +230,6 @@ async def run_pipeline(
         with destino.open("wb") as f:
             shutil.copyfileobj(arquivo.file, f)
         entrada = str(destino)
-
     req = PipelineRequest(
         entrada=entrada,
         estrategia_ausentes=estrategia_ausentes,
@@ -249,7 +249,6 @@ async def run_pipeline(
         "parametros": req.model_dump(),
     }
 
-
 @app.get("/pipeline/status/{job_id}")
 def pipeline_status(job_id: str) -> dict:
     """Consulta o andamento de um job. O n8n faz polling aqui até status virar
@@ -260,7 +259,10 @@ def pipeline_status(job_id: str) -> dict:
         raise HTTPException(status_code=404, detail=f"job_id desconhecido: {job_id}")
     return {"job_id": job_id, **job}
 
-
+@app.get("/pipeline/artifacts/{job_id}/{nome}")
+def get_artifact(job_id: str, nome: str):
+    path = f"data/processed/{nome}.csv"
+    return FileResponse(path, media_type="text/csv", filename=f"{nome}.csv")
 # ------------------------------------------------------------------
 # Compatibilidade: ainda dá para rodar o pipeline pelo terminal.
 # ------------------------------------------------------------------
