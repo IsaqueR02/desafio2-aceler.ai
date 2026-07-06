@@ -29,6 +29,7 @@ from pydantic import BaseModel, Field
 
 # Importar config ancora a raiz no sys.path e carrega o .env (fonte única de config).
 from config import settings
+from storage import upload_csv
 
 # ------------------------------------------------------------------
 # Diretórios e caminhos dos artefatos (vindos do config central).
@@ -163,17 +164,33 @@ def _processar_job(job_id: str, req: PipelineRequest) -> None:
     /health e o polling de status continuam respondendo enquanto o ETL roda.
     """
     JOBS[job_id]["status"] = "processando"
+
+    # Etapa 1: rodar o ETL. Falha aqui => erro de pipeline (404/422/500).
     try:
         JOBS[job_id]["logs"] = executar_pipeline(req)
-        JOBS[job_id]["artefatos"] = ARTEFATOS
-        JOBS[job_id]["status"] = "concluido"
     except HTTPException as exc:
-        # Erros de validação/execução tratados no pipeline (404/422/500).
         JOBS[job_id]["status"] = "erro"
         JOBS[job_id]["erro"] = exc.detail
+        return
     except Exception as exc:  # rede de segurança para qualquer falha inesperada
         JOBS[job_id]["status"] = "erro"
         JOBS[job_id]["erro"] = str(exc)
+        return
+
+    # Etapa 2: subir os artefatos para o Supabase Storage e guardar as URLs.
+    # Separado do ETL de propósito: se o upload falhar (ex.: credencial errada),
+    # a mensagem deixa claro que o pipeline em si concluiu — o n8n não vai
+    # confundir um problema de storage com um problema de dados.
+    try:
+        JOBS[job_id]["artefatos"] = {
+            nome: upload_csv(caminho) for nome, caminho in ARTEFATOS.items()
+        }
+    except Exception as exc:
+        JOBS[job_id]["status"] = "erro"
+        JOBS[job_id]["erro"] = f"Pipeline concluído, mas o upload ao Supabase falhou: {exc}"
+        return
+
+    JOBS[job_id]["status"] = "concluido"
 
 
 API_KEY = os.getenv("PIPELINE_API_KEY")
@@ -258,11 +275,6 @@ def pipeline_status(job_id: str) -> dict:
     if job is None:
         raise HTTPException(status_code=404, detail=f"job_id desconhecido: {job_id}")
     return {"job_id": job_id, **job}
-
-@app.get("/pipeline/artifacts/{job_id}/{nome}")
-def get_artifact(job_id: str, nome: str):
-    path = f"data/processed/{nome}.csv"
-    return FileResponse(path, media_type="text/csv", filename=f"{nome}.csv")
 # ------------------------------------------------------------------
 # Compatibilidade: ainda dá para rodar o pipeline pelo terminal.
 # ------------------------------------------------------------------
