@@ -20,9 +20,10 @@ import os
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 # Importar config ancora a raiz no sys.path e carrega o .env (fonte única de config).
@@ -126,6 +127,54 @@ def executar_pipeline(req: PipelineRequest) -> list[str]:
         logs.append(resultado.stdout.strip())
     return logs
 
+
+# ------------------------------------------------------------------
+# Execução assíncrona: registro de jobs em memória.
+#
+# Por quê: processar um CSV grande leva minutos. Se fizermos isso DENTRO da
+# requisição HTTP, o proxy do Render (e o nó HTTP do n8n) estoura o timeout e
+# devolve 502. A solução é responder 202 na hora com um job_id e processar em
+# background; o n8n consulta GET /pipeline/status/{job_id} até terminar.
+#
+# Analogia .NET: um ConcurrentDictionary<string, JobStatus> alimentado por um
+# BackgroundService. LIMITAÇÃO consciente: este dicionário vive na MEMÓRIA do
+# processo — some se o serviço reiniciar e não é compartilhado entre instâncias.
+# Para o escopo atual (1 instância) é suficiente; se um dia escalar, troque por
+# Redis/banco. Veja "Pontos de atenção".
+# ------------------------------------------------------------------
+ARTEFATOS = {
+    "serie_base": str(S3),
+    "agregacoes": str(AGREGACOES),
+    "rankings": str(RANKINGS),
+    "crescimento": str(CRESCIMENTO),
+    "comparacao": str(COMPARACAO),
+    "final": str(FINAL),
+}
+
+JOBS: dict[str, dict] = {}
+
+
+def _processar_job(job_id: str, req: PipelineRequest) -> None:
+    """Roda o pipeline em background e atualiza o status do job.
+
+    Como é uma função síncrona (def), o BackgroundTasks a executa num THREADPOOL,
+    então o subprocess.run bloqueante NÃO congela o event loop do uvicorn — o
+    /health e o polling de status continuam respondendo enquanto o ETL roda.
+    """
+    JOBS[job_id]["status"] = "processando"
+    try:
+        JOBS[job_id]["logs"] = executar_pipeline(req)
+        JOBS[job_id]["artefatos"] = ARTEFATOS
+        JOBS[job_id]["status"] = "concluido"
+    except HTTPException as exc:
+        # Erros de validação/execução tratados no pipeline (404/422/500).
+        JOBS[job_id]["status"] = "erro"
+        JOBS[job_id]["erro"] = exc.detail
+    except Exception as exc:  # rede de segurança para qualquer falha inesperada
+        JOBS[job_id]["status"] = "erro"
+        JOBS[job_id]["erro"] = str(exc)
+
+
 API_KEY = os.getenv("PIPELINE_API_KEY")
 
 
@@ -146,8 +195,9 @@ def health() -> dict:
     return {"status": "ok", "raw_data_path": str(settings.raw_data_path)}
 
 
-@app.post("/pipeline/run")
+@app.post("/pipeline/run", status_code=202)
 async def run_pipeline(
+    background_tasks: BackgroundTasks,
     # O CSV bruto enviado pelo n8n (nó Google Drive -> HTTP Request, body
     # multipart/form-data). Opcional: se ausente, cai no settings.raw_data_path —
     # útil ao rodar localmente com o arquivo já em disco.
@@ -157,14 +207,18 @@ async def run_pipeline(
     indicadores: str | None = Form(default=None),  # códigos separados por vírgula
     indicador_comparacao: str | None = Form(default=None),
 ) -> dict:
-    """Recebe o CSV bruto (upload), roda o pipeline completo e devolve os
-    caminhos dos artefatos + logs — tudo numa única requisição.
+    """Recebe o CSV bruto (upload), ENFILEIRA o pipeline em background e devolve
+    202 + job_id na hora. O n8n acompanha por GET /pipeline/status/{job_id}.
 
-    Por que upload+run juntos: o filesystem do Render é EFÊMERO (some a cada
-    deploy/restart/spin-down). Separar 'upload' de 'run' em duas chamadas guardaria
-    estado entre requisições numa plataforma stateless — frágil. Aqui o arquivo só
-    precisa existir durante o processamento, então gravamos em RAW_DIR (descartável)
-    e apontamos o pipeline para ele.
+    Por que assíncrono: processar o CSV grande leva minutos; fazer isso dentro da
+    requisição estoura o timeout do proxy (Render) e do n8n -> 502. Aqui só o
+    trabalho RÁPIDO (salvar o upload) roda na requisição; o ETL pesado vai pro
+    background.
+
+    Por que salvar o arquivo AGORA e não no background: o UploadFile é fechado
+    quando a resposta é enviada — não daria para lê-lo depois. Então persistimos
+    em RAW_DIR (efêmero/descartável, resolvido pela raiz do projeto) e passamos
+    apenas o CAMINHO para o job.
     """
     entrada: str | None = None
     if arquivo is not None:
@@ -183,21 +237,28 @@ async def run_pipeline(
         indicador_comparacao=indicador_comparacao,
     )
 
-    logs = executar_pipeline(req)
+    job_id = uuid.uuid4().hex
+    JOBS[job_id] = {"status": "pendente", "logs": None, "artefatos": None, "erro": None}
+    # add_task só dispara DEPOIS que esta resposta 202 for enviada ao n8n.
+    background_tasks.add_task(_processar_job, job_id, req)
+
     return {
-        "status": "ok",
+        "status": "aceito",
+        "job_id": job_id,
+        "status_url": f"/pipeline/status/{job_id}",
         "parametros": req.model_dump(),
-        "artefatos": {
-            "serie_base": str(S3),
-            "agregacoes": str(AGREGACOES),
-            "rankings": str(RANKINGS),
-            "crescimento": str(CRESCIMENTO),
-            "comparacao": str(COMPARACAO),
-            "final": str(FINAL),
-        },
-        "logs": logs,
     }
 
+
+@app.get("/pipeline/status/{job_id}")
+def pipeline_status(job_id: str) -> dict:
+    """Consulta o andamento de um job. O n8n faz polling aqui até status virar
+    'concluido' ou 'erro'. Estados: pendente -> processando -> concluido | erro.
+    """
+    job = JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"job_id desconhecido: {job_id}")
+    return {"job_id": job_id, **job}
 
 
 # ------------------------------------------------------------------
