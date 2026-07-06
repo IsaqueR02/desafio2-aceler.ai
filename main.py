@@ -17,11 +17,12 @@ Ainda funciona como CLI (compatibilidade):
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 
 # Importar config ancora a raiz no sys.path e carrega o .env (fonte única de config).
@@ -32,6 +33,10 @@ from config import settings
 # ------------------------------------------------------------------
 SCRIPTS = settings.project_root / "scripts"
 PROC = settings.processed_path
+# Pasta onde o CSV enviado pelo n8n é gravado antes de processar. Resolvida pela
+# raiz do projeto (absoluta) — NUNCA um "data/raw" relativo, que dependeria do
+# diretório de trabalho e quebraria no Render.
+RAW_DIR = settings.raw_data_path.parent
 
 S1 = PROC / "s1.csv"
 S2 = PROC / "s2.csv"
@@ -134,11 +139,6 @@ app = FastAPI(
 def root():
     return {"message": "Servidor FastAPI está rodando!"}
 
-@app.post("/pipeline/run")
-def run_pipeline():
-    subprocess.run(["python", "main.py"])
-    return {"status": "Pipeline executado com sucesso"}
-
 
 @app.get("/health")
 def health() -> dict:
@@ -147,8 +147,42 @@ def health() -> dict:
 
 
 @app.post("/pipeline/run")
-def run_pipeline(req: PipelineRequest) -> dict:
-    """Executa o pipeline completo e devolve os caminhos dos artefatos + logs."""
+async def run_pipeline(
+    # O CSV bruto enviado pelo n8n (nó Google Drive -> HTTP Request, body
+    # multipart/form-data). Opcional: se ausente, cai no settings.raw_data_path —
+    # útil ao rodar localmente com o arquivo já em disco.
+    arquivo: UploadFile | None = File(default=None),
+    # Em multipart os demais parâmetros chegam como campos de formulário, não JSON.
+    estrategia_ausentes: str = Form(default="descartar"),
+    indicadores: str | None = Form(default=None),  # códigos separados por vírgula
+    indicador_comparacao: str | None = Form(default=None),
+) -> dict:
+    """Recebe o CSV bruto (upload), roda o pipeline completo e devolve os
+    caminhos dos artefatos + logs — tudo numa única requisição.
+
+    Por que upload+run juntos: o filesystem do Render é EFÊMERO (some a cada
+    deploy/restart/spin-down). Separar 'upload' de 'run' em duas chamadas guardaria
+    estado entre requisições numa plataforma stateless — frágil. Aqui o arquivo só
+    precisa existir durante o processamento, então gravamos em RAW_DIR (descartável)
+    e apontamos o pipeline para ele.
+    """
+    entrada: str | None = None
+    if arquivo is not None:
+        # Grava o upload via streaming (copyfileobj) — não carrega o CSV inteiro
+        # na memória, o que importa para o dataset grande do EdStats.
+        RAW_DIR.mkdir(parents=True, exist_ok=True)
+        destino = RAW_DIR / (arquivo.filename or "upload.csv")
+        with destino.open("wb") as f:
+            shutil.copyfileobj(arquivo.file, f)
+        entrada = str(destino)
+
+    req = PipelineRequest(
+        entrada=entrada,
+        estrategia_ausentes=estrategia_ausentes,
+        indicadores=[c.strip() for c in indicadores.split(",") if c.strip()] if indicadores else None,
+        indicador_comparacao=indicador_comparacao,
+    )
+
     logs = executar_pipeline(req)
     return {
         "status": "ok",
@@ -163,6 +197,7 @@ def run_pipeline(req: PipelineRequest) -> dict:
         },
         "logs": logs,
     }
+
 
 
 # ------------------------------------------------------------------
