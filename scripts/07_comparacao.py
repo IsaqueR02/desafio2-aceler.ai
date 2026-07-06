@@ -21,9 +21,22 @@ def comparar_paises(entrada: str, saida: str, indicador: str | None = None) -> p
     """Pivota países x anos para um indicador e grava a matriz em `saida`."""
     df = pd.read_csv(entrada, low_memory=False)
 
+    # Guarda-chuva: se a entrada não trouxer NENHUM indicador válido (ex.: a etapa
+    # 03 filtrou por um código inexistente e devolveu um CSV vazio), falha com uma
+    # mensagem clara. Sem isto, value_counts().idxmax() abaixo estoura um
+    # "ValueError: attempt to get argmax of an empty sequence" (Traceback feio =>
+    # 500 no main.py), escondendo a verdadeira causa: o filtro da etapa 03.
+    serie = df["indicador_codigo"].dropna() if "indicador_codigo" in df.columns else pd.Series(dtype="object")
+    if serie.empty:
+        sys.exit(
+            "[07] entrada sem indicadores válidos — nada a comparar. "
+            "Provavelmente o filtro de indicadores da etapa 03 não casou com "
+            "nenhum código (confira se está usando um 'indicador_codigo' real)."
+        )
+
     if indicador is None:
         # Indicador com maior cobertura (mais linhas) = comparação mais rica.
-        indicador = df["indicador_codigo"].value_counts().idxmax()
+        indicador = serie.value_counts().idxmax()
 
     dados = df[df["indicador_codigo"] == indicador]
     if dados.empty:
