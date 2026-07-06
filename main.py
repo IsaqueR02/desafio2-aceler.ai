@@ -121,19 +121,7 @@ def executar_pipeline(req: PipelineRequest) -> list[str]:
         logs.append(resultado.stdout.strip())
     return logs
 
-
-# ------------------------------------------------------------------
-# Segurança: autenticação OPCIONAL por token de cabeçalho.
-# Ao expor o pipeline via HTTP, qualquer um na rede pode chamá-lo. Se
-# PIPELINE_API_KEY existir no .env, exigimos o header 'X-API-Key' igual
-# a ele; sem a variável, o serviço fica aberto (conveniente em dev).
-# ------------------------------------------------------------------
 API_KEY = os.getenv("PIPELINE_API_KEY")
-
-
-def verificar_token(x_api_key: str | None = Header(default=None)) -> None:
-    if API_KEY and x_api_key != API_KEY:
-        raise HTTPException(status_code=401, detail="Token de API inválido ou ausente.")
 
 
 app = FastAPI(
@@ -158,7 +146,7 @@ def health() -> dict:
     return {"status": "ok", "raw_data_path": str(settings.raw_data_path)}
 
 
-@app.post("/pipeline/run", dependencies=[Depends(verificar_token)])
+@app.post("/pipeline/run")
 def run_pipeline(req: PipelineRequest) -> dict:
     """Executa o pipeline completo e devolve os caminhos dos artefatos + logs."""
     logs = executar_pipeline(req)
